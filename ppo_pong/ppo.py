@@ -149,8 +149,9 @@ def main():
     with torch.no_grad():
         td = test_env.rollout(max_steps=1000)
         td = td.to(device)
-        td = actor_critic(td)  # TODO: after forward pass actions are only 0 or 1. Why?
+        td = actor_critic(td)
 
+    # TODO: why wrap them together and then get separate operators ?
     # Get independent operators for actor and critic, to be able to call only one of them
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
@@ -167,32 +168,15 @@ def main():
 
     # 3. Define Loss ---------------------------------------------------------------------------------------------------
 
-    # advantage_module = GAE(
-    #     gamma=args.gamma,
-    #     lmbda=args.gae_lamdda,
-    #     value_network=actor_critic,
-    # )
-
     advantage_module = GAE(
         gamma=args.gamma,
         lmbda=args.gae_lamdda,
         value_network=critic,
     )
 
-    # loss = ClipPPOLoss(
-    #     actor=actor_critic,  # TODO: does this work? or do I need to split into two modules
-    #     critic=actor_critic,  # TODO: does this work? or do I need to split into two modules
-    #     clip_epsilon=args.clip_epsilon,
-    #     loss_critic_type=args.loss_critic_type,
-    #     entropy_coef=args.entropy_coef,
-    #     critic_coef=args.critic_coef,
-    #     gamma=args.gamma,
-    #     advantage_module=advantage_module,
-    # )
-
     loss_module = ClipPPOLoss(
-        actor=actor,  # TODO: does this work? or do I need to split into two modules
-        critic=critic,  # TODO: does this work? or do I need to split into two modules
+        actor=actor,
+        critic=critic,
         clip_epsilon=args.clip_epsilon,
         loss_critic_type=args.loss_critic_type,
         entropy_coef=args.entropy_coef,
