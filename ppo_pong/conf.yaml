@@ -1,0 +1,27 @@
+# Logger
+experiment_name: atari_pong
+agent_name: ppo_agent
+wandb_key: null
+log_dir: /tmp/atari_pong
+
+# Environment
+env_name: PongNoFrameskip-v4
+frame_skip: 4
+
+# Collector
+total_frames: 10_000_000 # in increments of num_parallel_envs * steps_per_env
+num_parallel_envs: 8
+steps_per_env: 128 # between network updates
+
+# Loss
+gamma: 0.99
+clip_epsilon: 0.1
+loss_critic_type: l2
+entropy_coef: 0.01
+critic_coef: 1.0
+gae_lamdda: 0.95
+
+# Training loop
+num_ppo_epochs: 3
+mini_batch_size: 256  # so 4 mini_batches - (8 * 128) / 256
+lr: 2.5e-4
