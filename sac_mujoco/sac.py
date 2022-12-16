@@ -2,6 +2,7 @@
 
 
 import argparse
+import yaml
 from typing import Optional
 
 import numpy as np
@@ -576,6 +577,13 @@ def get_args():
         "--device", type=str, default="cuda:0", help="Training device. Default: cuda:0"
     )
     args = parser.parse_args()
+    
+    # Update args with conf.yaml
+    if args.conf.endswith('yaml'):
+        with open(args.conf) as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        args.__dict__.update(config)
+
     return args
 
 
