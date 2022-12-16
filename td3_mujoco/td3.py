@@ -430,7 +430,7 @@ def main():
                         "q_loss": np.mean(q_losses),
                     }
                 )
-                td_record = recorder(None)
+            td_record = recorder(None)
             if td_record is not None:
                 rewards_eval.append(
                     (
