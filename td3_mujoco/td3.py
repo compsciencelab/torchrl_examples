@@ -449,7 +449,13 @@ def main():
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="")
+    """Reads conf.yaml file in the same directory"""
+
+    parser = argparse.ArgumentParser(description="RL")
+
+    # Configuration file, keep first
+    parser.add_argument("--conf", "-c", default="conf.yaml")
+
     parser.add_argument(
         "--exp_name", type=str, default="cheetah", help="Experiment name. Default: cheetah"
     )
