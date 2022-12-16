@@ -72,13 +72,6 @@ def make_transformed_env(
     # we append transforms one by one, although we might as well create the transformed environment using the `env = TransformedEnv(base_env, transforms)` syntax.
     env.append_transform(RewardScaling(loc=0.0, scale=args.reward_scaling))
 
-    double_to_float_list = []
-    double_to_float_inv_list = []
-
-    # We concatenate all states into a single "observation_vector"
-    # even if there is a single tensor, it'll be renamed in "observation_vector".
-    # This facilitates the downstream operations as we know the name of the output tensor.
-    # In some environments (not half-cheetah), there may be more than one observation vector: in this case this code snippet will concatenate them all.
     selected_keys = list(env.observation_spec.keys())
     out_key = "observation_vector"
     env.append_transform(CatTensors(in_keys=selected_keys, out_key=out_key))
@@ -92,10 +85,9 @@ def make_transformed_env(
         ObservationNorm(**_stats, in_keys=[out_key], standard_normal=True)
     )
 
-    double_to_float_list.append(out_key)
     env.append_transform(
         DoubleToFloat(
-            in_keys=double_to_float_list, in_keys_inv=double_to_float_inv_list
+            in_keys=[out_key], in_keys_inv=[]
         )
     )
 
@@ -104,16 +96,17 @@ def make_transformed_env(
 
 def parallel_env_constructor(
     stats,
+    num_worker=1,
     **env_kwargs,
 ):
-    if args.env_per_collector == 1:
+    if num_worker == 1:
         env_creator = EnvCreator(
             lambda: make_transformed_env(make_env(), stats, **env_kwargs)
         )
         return env_creator
 
     parallel_env = ParallelEnv(
-        num_workers=args.env_per_collector,
+        num_workers=num_worker,
         create_env_fn=EnvCreator(lambda: make_env()),
         create_env_kwargs=None,
         pin_memory=False,
@@ -172,14 +165,14 @@ def get_env_stats():
 
 
 def make_recorder(actor_model_explore, stats):
+    #test_env = parallel_env_constructor(stats, num_worker=5)
     base_env = make_env()
-    recorder = make_transformed_env(base_env, stats)
-
+    test_env = make_transformed_env(base_env, stats)
     recorder_obj = Recorder(
         record_frames=1000,
         frame_skip=args.frame_skip,
         policy_exploration=actor_model_explore,
-        recorder=recorder,
+        recorder=test_env,
         exploration_mode="mean",
         record_interval=args.record_interval,
     )
@@ -223,15 +216,13 @@ def main():
     stats = get_env_stats()
 
     # Create Environment
-    create_env_fn = parallel_env_constructor(
-        stats=stats,
-    )
+    train_env = parallel_env_constructor(stats=stats, num_worker=args.env_per_collector)
 
     # Create Agent
 
     # Define Actor Network
     in_keys = ["observation_vector"]
-    action_spec = create_env_fn.action_spec
+    action_spec = train_env.action_spec
     actor_net_kwargs = {
         "num_cells": [256, 256],
         "out_features": action_spec.shape[-1],
@@ -316,10 +307,10 @@ def main():
 
     # Make Off-Policy Collector
     collector = MultiaSyncDataCollector(
-        create_env_fn=[create_env_fn],
+        create_env_fn=[train_env],
         policy=actor_model_explore,
         total_frames=args.total_frames,
-        max_frames_per_traj=args.env_per_collector*args.frames_per_batch,
+        max_frames_per_traj=args.frames_per_batch,
         frames_per_batch=args.env_per_collector*args.frames_per_batch,
         init_random_frames=args.init_random_frames,
         reset_at_each_iter=False,
@@ -337,7 +328,7 @@ def main():
     # Make Replay Buffer
     replay_buffer = make_replay_buffer()
 
-    # Trajectory recorder
+    # Trajectory recorder for evaluation
     recorder = make_recorder(actor_model_explore, stats)
 
     # Optimizers
@@ -356,13 +347,9 @@ def main():
 
     # Main loop
     target_net_updater.init_()
-    norm_factor_training = (
-        sum(args.gamma**i for i in range(args.n_steps_forward))
-        if args.n_steps_forward
-        else 1
-    )
 
     collected_frames = 0
+    episodes = 0
     pbar = tqdm.tqdm(total=args.total_frames)
     r0 = None
     q_loss = None
@@ -374,7 +361,7 @@ def main():
             collector.update_policy_weights_()
 
             if r0 is None:
-                r0 = tensordict["reward"].sum().item()
+                r0 = tensordict["reward"].sum(-1).mean().item()
             pbar.update(tensordict.numel())
 
             # extend the replay buffer with the new data
@@ -386,6 +373,7 @@ def main():
                 tensordict = tensordict.view(-1)
                 current_frames = tensordict.numel()
             collected_frames += current_frames
+            episodes += args.env_per_collector
             replay_buffer.extend(tensordict.cpu())
 
             # optimization steps
@@ -394,7 +382,7 @@ def main():
                     actor_losses,
                     q_losses,
                 ) = ([], [])
-                for i in range(args.env_per_collector*args.optim_steps_per_batch):
+                for i in range(args.env_per_collector * args.frames_per_batch * args.utd_ratio):
                     # sample from replay buffer
                     sampled_tensordict = replay_buffer.sample(args.batch_size).clone()
 
@@ -426,14 +414,13 @@ def main():
                     i,
                     tensordict["reward"].sum().item()
                     / args.env_per_collector
-                    / norm_factor_training
-                    / args.frame_skip,
                 )
             )
             wandb.log(
                 {
                     "train_reward": rewards[-1][1],
                     "collected_frames": collected_frames,
+                    "episodes": episodes,
                 }
             )
             if q_loss is not None:
@@ -443,10 +430,16 @@ def main():
                         "q_loss": np.mean(q_losses),
                     }
                 )
-            td_record = recorder(None)
+                td_record = recorder(None)
             if td_record is not None:
-                rewards_eval.append((i, td_record["total_r_evaluation"]))
-                wandb.log({"test_reward": td_record["total_r_evaluation"]})
+                rewards_eval.append(
+                    (
+                        i,
+                        td_record["total_r_evaluation"]
+                        / 1
+                    )
+                )  # divide by number of eval worker
+                wandb.log({"test_reward": rewards_eval[-1][1]})
             if len(rewards_eval):
                 pbar.set_description(
                     f"reward: {rewards[-1][1]: 4.4f} (r0 = {r0: 4.4f}), test reward: {rewards_eval[-1][1]: 4.4f}"
@@ -499,8 +492,8 @@ def get_args():
     parser.add_argument(
         "--record_interval",
         type=int,
-        default=10,
-        help="Record interval for metrics logging based ob update iteration. Default: 10",
+        default=1,
+        help="Record interval for metrics logging based ob update iteration. Default: 1",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Seed for the experiment. Default: 42"
@@ -563,10 +556,10 @@ def get_args():
         "--batch_size", type=int, default=256, help="Batch size. Default: 256"
     )
     parser.add_argument(
-        "--optim_steps_per_batch",
+        "--utd_ratio",
         type=int,
-        default=1000,
-        help="Number of updating steps after each data collection rollout. Default: 1000",
+        default=1,
+        help="Update-to_Data ratio. For off policy algorithms we want to take at least one updating step each transition sampled. Default: 1",
     )
     parser.add_argument(
         "--lr", type=float, default=3e-4, help="Learning rate. Default: 3e-4"
