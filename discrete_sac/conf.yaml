@@ -1,0 +1,29 @@
+# Logger
+exp_name: cheetah
+record_interval: 1
+
+# Environment
+task: CartPole-v1
+frame_skip: 1
+from_pixels: false
+reward_scaling: 1.0
+init_env_steps: 1000
+seed: 42
+
+# Collector
+env_per_collector: 5
+total_frames: 1000000
+init_random_frames: 1000
+frames_per_batch: 200
+
+# Replay Buffer
+prb: 0
+buffer_size: 100000
+
+# Optimization
+gamma: 0.99
+batch_size: 256
+lr: 3.0e-4
+weight_decay: 0.0
+target_update_polyak: 0.995
+target_entropy_weight: 0.2
