@@ -403,8 +403,8 @@ def main():
                         optimizer_actor.step()
                         actor_losses.append(actor_loss.item())
 
-                    # update qnet_target params
-                    target_net_updater.step()
+                        # update qnet_target params
+                        target_net_updater.step()
 
                     # update priority
                     if args.prb:

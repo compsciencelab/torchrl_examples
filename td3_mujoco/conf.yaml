@@ -6,7 +6,7 @@ record_interval: 1
 task: HalfCheetah-v4
 frame_skip: 2
 from_pixels: false
-reward_scaling: 5.0
+reward_scaling: 1.0
 init_env_steps: 1000
 seed: 42
 
