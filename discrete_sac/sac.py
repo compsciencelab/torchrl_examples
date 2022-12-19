@@ -327,7 +327,7 @@ def main():
     r0 = None
     loss = None
 
-    with wandb.init(project="SAC_TorchRL", name=args.exp_name, config=args):
+    with wandb.init(project="discrete_SAC_TorchRL", name=args.exp_name, config=args):
         for i, tensordict in enumerate(collector):
 
             # update weights of the inference policy
@@ -445,20 +445,20 @@ def get_args():
     parser.add_argument(
         "--exp_name",
         type=str,
-        default="cheetah",
-        help="Experiment name. Default: cheetah",
+        default="discrete_sac",
+        help="Experiment name. Default: discrete_sac",
     )
     parser.add_argument(
         "--task",
         type=str,
-        default="HalfCheetah-v4",
-        help="MuJoCo training task. Default: HalfCheetah-v4",
+        default="CartPole-v1",
+        help="MuJoCo training task. Default: CartPole-v1",
     )
     parser.add_argument(
         "--frame_skip",
         type=int,
-        default=2,
-        help="Number of frames to skip also called action repeat. Default: 2",
+        default=1,
+        help="Number of frames to skip also called action repeat. Default: 1",
     )
     parser.add_argument(
         "--from_pixels",
@@ -469,8 +469,8 @@ def get_args():
     parser.add_argument(
         "--reward_scaling",
         type=float,
-        default=5.0,
-        help="Reward scaling factor. Default: 5.0",
+        default=1.0,
+        help="Reward scaling factor. Default: 1.0",
     )
     parser.add_argument(
         "--init_env_steps",
