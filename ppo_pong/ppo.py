@@ -1,5 +1,5 @@
+import time
 import yaml
-import tqdm
 import wandb
 import torch
 import argparse
@@ -45,8 +45,7 @@ def main():
         create_env_fn = lambda: GymEnv(env_name=args.env_name, frame_skip=args.frame_skip)
 
         # 1.2 Create env vector
-        # vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=args.num_parallel_envs)
-        vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=8)
+        vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=args.num_parallel_envs)
 
         # 1.3 Apply transformations to vec env - standard DeepMind Atari - Order of transforms is important!
         transformed_vec_env = TransformedEnv(vec_env)
@@ -80,7 +79,7 @@ def main():
     )
     common_cnn_output = common_cnn(torch.ones_like(test_input["pixels"]))
 
-    # Add MLP on top of shared CNN
+    # Add MLP on top of shared MLP
     common_mlp = MLP(
         in_features=common_cnn_output.shape[-1],
         activation_class=torch.nn.ReLU,
@@ -106,17 +105,17 @@ def main():
     )
 
     # Define TensorDictModule
-    policy_module = SafeModule(
+    policy_module = SafeModule(  # TODO: The naming of SafeModule is confusing
         module=policy_net,
         in_keys=["common_features"],
-        out_keys=["action_logits"],
+        out_keys=["logits"],
     )
 
     # Add probabilistic sampling of the actions
     policy_module = ProbabilisticActor(
         policy_module,
-        dist_in_keys={"logits": "action_logits"},  # TODO: Seems like only "logits" can be used as in_keys. Why?
-        sample_out_key=["action"],
+        in_keys=["logits"],  # TODO: Seems like only "logits" can be used as in_keys
+        #        out_keys=["action"],
         distribution_class=OneHotCategorical,
         distribution_kwargs={},
         return_log_prob=True,
@@ -156,6 +155,10 @@ def main():
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
 
+    # Ugly hack, otherwise I get errors
+    critic.out_keys = ['state_value', 'common_features']
+    actor.out_keys = ['action', 'common_features', 'logits']
+
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
     collector = SyncDataCollector(
@@ -172,6 +175,7 @@ def main():
         gamma=args.gamma,
         lmbda=args.gae_lamdda,
         value_network=critic,
+        average_gae=True,
     )
 
     loss_module = ClipPPOLoss(
@@ -182,7 +186,6 @@ def main():
         entropy_coef=args.entropy_coef,
         critic_coef=args.critic_coef,
         gamma=args.gamma,
-        advantage_module=advantage_module,
     )
 
     # 4. Define logger -------------------------------------------------------------------------------------------------
@@ -207,12 +210,25 @@ def main():
 
     with wandb.init(project=args.experiment_name, name=args.agent_name, config=args, mode=mode):
 
+        start_time = time.time()
+
         for batch in collector:
 
+            log_info = {}
+
+            # Compute advantage with the whole batch
+            batch = advantage_module(batch)
+
             # We don't use memory networks, so sequence dimension is not relevant
-            batch = batch.reshape(-1)
             batch_size = batch.batch_size.numel()
             collected_frames += batch_size
+            batch = batch.reshape(-1)
+
+            # add episode reward info
+            train_episode_reward = batch["episode_reward"][batch["done"]]
+            if batch["episode_reward"][batch["done"]].numel() > 0:
+                log_info.update({"train_episode_rewards": train_episode_reward.mean()})
+            # episode_steps = batch["episode_steps"][batch["done"]]
 
             # PPO epochs
             for epoch in range(args.num_ppo_epochs):
@@ -238,19 +254,43 @@ def main():
                     scheduler.step()
                     network_updates += 1
 
-                    log_info = {
+                    log_info.update({
                         "loss": loss_sum.item(),
                         "loss_critic": loss["loss_critic"].item(),
                         "loss_entropy": loss["loss_entropy"].item(),
                         "loss_objective": loss["loss_objective"].item(),
                         "learning_rate": float(scheduler.get_last_lr()[0]),
                         "collected_frames": collected_frames,
-                    }
+                    })
+
+                    if network_updates % args.evaluation_frequency == 0 and network_updates != 0:
+                        # Run evaluation in test environment
+                        with set_exploration_mode("mode"):
+                            test_env.eval()
+                            test_td = test_env.rollout(
+                                policy=actor,
+                                max_steps=100000,
+                                auto_reset=True,
+                                auto_cast_to_device=True,
+                            ).clone()
+                        log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
+
+                    # Print an informative message in the terminal
+                    fps = int(collected_frames * args.frame_skip / (time.time() - start_time))
+                    print_msg = f"Update {network_updates}, num " \
+                                f"samples collected {collected_frames * args.frame_skip}, FPS {fps}\n    "
+                    for k, v in log_info.items():
+                        print_msg += f"{k}: {v} "
+                    print(print_msg, flush=True)
+
+                    # Log info to wandb
+                    log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
+                    wandb.log(log_info, step=network_updates)
 
                     if network_updates % evaluation_frequency == 0 and network_updates != 0:
 
                         # Run evaluation in test environment
-                        with set_exploration_mode("random"):  # TODO: is random correct ?
+                        with set_exploration_mode("random"), torch.no_grad():
                             test_env.eval()
                             test_td = test_env.rollout(
                                 policy=actor,
@@ -259,10 +299,13 @@ def main():
                             ).clone()
                         log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
 
+                    log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
                     wandb.log(log_info, step=network_updates)
-                    print(f"Collected frames: {collected_frames}")
-
                     del mini_batch
+
+            # Update collector weights!
+            collector.update_policy_weights_()
+
 
 def get_args():
     """Reads conf.yaml file in the same directory"""
@@ -286,3 +329,4 @@ def get_args():
 
 if __name__ == "__main__":
     main()
+
