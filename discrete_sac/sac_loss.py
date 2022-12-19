@@ -190,11 +190,6 @@ class SACLoss(LossModule):
             z = (probs == 0.0).float() * 1e-8
             logp_pi = torch.log(probs + z)
             logp_pi_pol = torch.sum(probs * logp_pi, dim=-1, keepdim=True)
-            # target_actions = tensordict_actor_dist.sample[1].detach()
-            # tensordict_actor[sample_key] = tensordict_actor_dist.sample()
-            # tensordict_actor["sample_log_prob"] = tensordict_actor_dist.log_prob(
-            #     tensordict_actor[sample_key]
-            # )
 
         # repeat tensordict_actor to match the qvalue size
         _actor_loss_td = (
@@ -244,11 +239,6 @@ class SACLoss(LossModule):
             [self.num_qvalue_nets, self.num_qvalue_nets, self.num_qvalue_nets],
             dim=0,
         )
-        # sample_log_prob = tensordict_actor.get("sample_log_prob").squeeze(-1)
-        # (
-        #     action_log_prob_actor,
-        #     next_action_log_prob_qvalue,
-        # ) = sample_log_prob.unbind(0)
 
         loss_actor = -(
             (state_action_value_actor.min(0)[0] * probs[0]).sum(1, keepdim=True) - self.alpha * logp_pi_pol[0]
@@ -260,8 +250,12 @@ class SACLoss(LossModule):
             tensordict,
             gamma=self.gamma,
             pred_next_val=next_state_value,
-        ).unsqueeze(-1)
-        pred_val = state_action_value_qvalue
+        )
+        
+        actions = torch.where(tensordict_select["action"])[1]
+        pred_val_1 = state_action_value_qvalue[0].gather(1, actions[:, None]).unsqueeze(0)
+        pred_val_2 = state_action_value_qvalue[1].gather(1, actions[:, None]).unsqueeze(0)
+        pred_val = torch.cat([pred_val_1, pred_val_2], dim=0).squeeze()
         td_error = (pred_val - target_value.expand_as(pred_val)).pow(2)
         loss_qval = (
             distance_loss(
