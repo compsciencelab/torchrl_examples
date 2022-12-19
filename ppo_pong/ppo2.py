@@ -8,7 +8,7 @@ import argparse
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs import TransformedEnv
 from torchrl.envs.vec_env import ParallelEnv
-from torchrl.envs.transforms import ToTensorImage, GrayScale, CatFrames, NoopResetEnv, Resize
+from torchrl.envs.transforms import ToTensorImage, GrayScale, CatFrames, NoopResetEnv, Resize, ObservationNorm
 
 # Model imports
 from torchrl.envs.utils import set_exploration_mode
@@ -18,16 +18,70 @@ from torchrl.modules import SafeModule, ProbabilisticActor, ValueOperator, Actor
 
 # Collector imports
 from torchrl.collectors.collectors import SyncDataCollector
-from torchrl.collectors.collectors import MultiSyncDataCollector  # This one gives an error related to reset!
 
 # Loss imports
 from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value.advantages import GAE
+from torchrl.objectives.value.advantages import GAE, TDEstimate
+from torchrl.objectives.utils import distance_loss
 
 # Training loop imports
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+
+# Testing
+from typing import Optional, Sequence
+from torchrl.envs.transforms import Transform
+from tensordict.tensordict import TensorDictBase
+
+
+class RewardSum(Transform):
+    """
+    Tracks the accumulated reward of each episode.
+
+    Requires ´reward´ and ´done´ to be input keys, and has no effect if that is not the case.
+    """
+
+    inplace = True
+
+    def __init__(
+        self,
+        in_keys: Optional[Sequence[str]] = None,
+        out_keys: Optional[Sequence[str]] = None,
+    ):
+        in_keys = ["reward", "done"]
+        if out_keys is None:
+            out_keys = ["episode_reward"]
+        super().__init__(in_keys=in_keys, out_keys=out_keys)
+        self.new_episode = None
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """Reads the input tensordict, and for the selected keys, applies the transform."""
+        self._check_inplace()
+
+        for in_key in self.in_keys:
+            if not in_key in tensordict.keys():
+                return tensordict
+
+        # Get input keys
+        reward = tensordict.get("reward")
+        done = tensordict.get("done")
+        done = done.to(reward.dtype)
+
+        # self.new_episode not initialized, assume its a new episode in all envs
+        if self.new_episode is None:
+            self.new_episode = torch.zeros_like(done)
+
+        for out_key in self.out_keys:
+            if not out_key in tensordict.keys():
+                tensordict.set(out_key, torch.zeros(*tensordict.shape, 1, dtype=reward.dtype))
+            updated_value = tensordict.get(out_key) * self.new_episode + reward
+            tensordict.set(out_key,  updated_value)
+
+        # Restart sum immediately after end-of-episode detected
+        self.new_episode = 1 - done
+
+        return tensordict
 
 
 def main():
@@ -50,10 +104,12 @@ def main():
         # 1.3 Apply transformations to vec env - standard DeepMind Atari - Order of transforms is important!
         transformed_vec_env = TransformedEnv(vec_env)
         # transformed_vec_env.append_transform(NoopResetEnv(noops=30))  # Start with 30 random action. TODO: seems incompatible with frame skip and ParallelEnv
-        transformed_vec_env.append_transform(ToTensorImage())  # change shape from [h, w, 3] to [3, h, w]
+        transformed_vec_env.append_transform(ToTensorImage())  # Change shape from [h, w, 3] to [3, h, w] for convs
         transformed_vec_env.append_transform(Resize(w=84, h=84))  # Resize image
         transformed_vec_env.append_transform(GrayScale())  # Convert to Grayscale
+        transformed_vec_env.append_transform(ObservationNorm(loc=0.0, scale=1/255.))  # Divide pixels values by 255
         transformed_vec_env.append_transform(CatFrames(N=4))  # Stack last 4 frames
+        transformed_vec_env.append_transform(RewardSum())  # Stack last 4 frames
 
         return transformed_vec_env
 
@@ -79,7 +135,7 @@ def main():
     )
     common_cnn_output = common_cnn(torch.ones_like(test_input["pixels"]))
 
-    # Add MLP on top of shared MLP
+    # Add MLP on top of shared CNN
     common_mlp = MLP(
         in_features=common_cnn_output.shape[-1],
         activation_class=torch.nn.ReLU,
@@ -105,17 +161,17 @@ def main():
     )
 
     # Define TensorDictModule
-    policy_module = SafeModule(  # TODO: The naming of SafeModule is confusing
+    policy_module = SafeModule(
         module=policy_net,
         in_keys=["common_features"],
-        out_keys=["logits"],
+        out_keys=["logits"],  # TODO: Seems like only "logits" can be used as out_keys
     )
 
     # Add probabilistic sampling of the actions
     policy_module = ProbabilisticActor(
         policy_module,
         in_keys=["logits"],  # TODO: Seems like only "logits" can be used as in_keys
-        #        out_keys=["action"],
+#        out_keys=["action"],
         distribution_class=OneHotCategorical,
         distribution_kwargs={},
         return_log_prob=True,
@@ -134,6 +190,7 @@ def main():
     value_module = ValueOperator(
         value_net,
         in_keys=["common_features"],
+#        out_keys=["state_value"],
     )
 
     # 2.5 Wrap modules in a single ActorCritic operator
@@ -155,9 +212,9 @@ def main():
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
 
-    # Ugly hack, otherwise I get errors
+    # TODO temporary fix. Critic outputs seems to be ['common_features', 'state_value'], causing an error
     critic.out_keys = ['state_value', 'common_features']
-    actor.out_keys = ['action', 'common_features', 'logits']
+    # actor.out_keys = ['action', 'common_features', 'logits']
 
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
@@ -165,7 +222,7 @@ def main():
         create_env_fn=env_factory,
         create_env_kwargs=None,
         policy=actor_critic,
-        total_frames=args.total_frames,
+        total_frames=args.total_frames // args.frame_skip,
         frames_per_batch=args.steps_per_env * args.num_parallel_envs,
     )
 
@@ -206,7 +263,6 @@ def main():
     total_network_updates = (args.total_frames // batch_size) * args.num_ppo_epochs * num_mini_batches
     optimizer = Adam(params=actor_critic.parameters(), lr=args.lr)
     scheduler = LinearLR(optimizer, total_iters=total_network_updates, start_factor=1.0, end_factor=0.1)
-    evaluation_frequency = 100  # In number of network frames
 
     with wandb.init(project=args.experiment_name, name=args.agent_name, config=args, mode=mode):
 
@@ -217,9 +273,9 @@ def main():
             log_info = {}
 
             # Compute advantage with the whole batch
-            batch = advantage_module(batch)
+            # batch = advantage_module(batch)
 
-            # We don't use memory networks, so sequence dimension is not relevant
+            # We don't use memory networks, so sequence dimension is not relevant after advantage computation
             batch_size = batch.batch_size.numel()
             collected_frames += batch_size
             batch = batch.reshape(-1)
@@ -228,7 +284,6 @@ def main():
             train_episode_reward = batch["episode_reward"][batch["done"]]
             if batch["episode_reward"][batch["done"]].numel() > 0:
                 log_info.update({"train_episode_rewards": train_episode_reward.mean()})
-            # episode_steps = batch["episode_steps"][batch["done"]]
 
             # PPO epochs
             for epoch in range(args.num_ppo_epochs):
@@ -240,30 +295,72 @@ def main():
                     # select idxs to create mini_batch
                     mini_batch = batch[mini_batch_idxs].clone()
 
-                    # Forward pass
-                    loss = loss_module(mini_batch)
-
+                    # Compute PPO loss
+                    # loss = loss_module(mini_batch)
                     # Add up losses
-                    loss_sum = sum([item for key, item in loss.items() if key.startswith("loss")])
+                    # total_loss = sum([item for key, item in loss.items() if key.startswith("loss")])
+
+                    advantage_module(mini_batch)
+                    action = mini_batch.get("action")
+                    advantage = mini_batch.get("advantage")
+                    prev_log_prob = mini_batch.get("sample_log_prob")
+                    old_value = mini_batch.get("state_value")
+                    target_value = mini_batch.get("value_target")
+
+                    # loss (1): Objective
+                    dist = actor.get_dist(mini_batch.clone(recurse=False))
+                    log_prob = dist.log_prob(action)
+                    log_prob = log_prob.unsqueeze(-1)
+                    log_weight = log_prob - prev_log_prob
+                    gain1 = log_weight.exp() * advantage
+                    log_weight_clip = torch.empty_like(log_weight)
+                    idx_pos = advantage >= 0
+                    log_weight_clip[idx_pos] = log_weight[idx_pos].clamp_max(args.clip_epsilon)
+                    log_weight_clip[~idx_pos] = log_weight[~idx_pos].clamp_min(args.clip_epsilon)
+                    gain2 = log_weight_clip.exp() * advantage
+                    gain = torch.stack([gain1, gain2], -1).min(dim=-1)[0]
+                    loss_objective = - gain.mean()
+
+                    # loss (2): Critic
+                    pred = critic(mini_batch.clone(recurse=False))
+                    value_pred = pred["state_value"]
+                    loss_critic1 = distance_loss(
+                        value_pred - target_value,
+                        torch.zeros_like(value_pred - target_value),
+                        loss_function="l2",
+                    )
+                    value_pred_clipped = old_value + (value_pred - old_value).clamp(-args.clip_epsilon, args.clip_epsilon)
+                    loss_critic2 = distance_loss(
+                        value_pred_clipped - target_value,
+                        torch.zeros_like(value_pred_clipped - target_value),
+                        loss_function="l2",
+                    )
+                    loss_critic = 0.5 * torch.max(loss_critic1, loss_critic2).mean() * args.critic_coef
+
+                    # loss (3): Entropy
+                    # Entropy bonus: we add a small entropy bonus to favour exploration
+                    entropy_loss = dist.entropy().mean() * args.entropy_coef
+
+                    total_loss = loss_objective + loss_critic - entropy_loss
 
                     # Update networks
                     optimizer.zero_grad()
-                    loss_sum.backward()
+                    total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), max_norm=0.5)
                     optimizer.step()
                     scheduler.step()
                     network_updates += 1
 
                     log_info.update({
-                        "loss": loss_sum.item(),
-                        "loss_critic": loss["loss_critic"].item(),
-                        "loss_entropy": loss["loss_entropy"].item(),
-                        "loss_objective": loss["loss_objective"].item(),
+                        "loss": total_loss.item(),
+                        "loss_critic": loss_critic,
+                        "loss_entropy": entropy_loss,
+                        "loss_objective": loss_objective.item(),
                         "learning_rate": float(scheduler.get_last_lr()[0]),
-                        "collected_frames": collected_frames,
                     })
 
                     if network_updates % args.evaluation_frequency == 0 and network_updates != 0:
+
                         # Run evaluation in test environment
                         with set_exploration_mode("mode"):
                             test_env.eval()
@@ -287,24 +384,12 @@ def main():
                     log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
                     wandb.log(log_info, step=network_updates)
 
-                    if network_updates % evaluation_frequency == 0 and network_updates != 0:
-
-                        # Run evaluation in test environment
-                        with set_exploration_mode("random"), torch.no_grad():
-                            test_env.eval()
-                            test_td = test_env.rollout(
-                                policy=actor,
-                                max_steps=100000,
-                                auto_cast_to_device=True,
-                            ).clone()
-                        log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
-
-                    log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
-                    wandb.log(log_info, step=network_updates)
                     del mini_batch
 
-            # Update collector weights!
-            collector.update_policy_weights_()
+        # Update collector weights!
+        collector.update_policy_weights_()
+
+        collector.shutdown()
 
 
 def get_args():
@@ -329,4 +414,3 @@ def get_args():
 
 if __name__ == "__main__":
     main()
-
