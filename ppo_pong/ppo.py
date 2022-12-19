@@ -264,6 +264,10 @@ def main():
 
                     del mini_batch
 
+            # Update collector weights!
+            collector.update_policy_weights_()
+
+
 def get_args():
     """Reads conf.yaml file in the same directory"""
 
