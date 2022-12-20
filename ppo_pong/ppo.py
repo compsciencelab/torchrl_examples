@@ -282,22 +282,6 @@ def main():
                         print_msg += f"{k}: {v} "
                     print(print_msg, flush=True)
 
-                    # Log info to wandb
-                    log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
-                    wandb.log(log_info, step=network_updates)
-
-                    if network_updates % evaluation_frequency == 0 and network_updates != 0:
-
-                        # Run evaluation in test environment
-                        with set_exploration_mode("random"), torch.no_grad():
-                            test_env.eval()
-                            test_td = test_env.rollout(
-                                policy=actor,
-                                max_steps=100000,
-                                auto_cast_to_device=True,
-                            ).clone()
-                        log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
-
                     log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
                     wandb.log(log_info, step=network_updates)
                     del mini_batch
