@@ -264,7 +264,7 @@ def main():
 
                     if network_updates % args.evaluation_frequency == 0 and network_updates != 0:
                         # Run evaluation in test environment
-                        with set_exploration_mode("mode"):
+                        with set_exploration_mode("random"):
                             test_env.eval()
                             test_td = test_env.rollout(
                                 policy=actor,
