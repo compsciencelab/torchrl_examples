@@ -225,9 +225,9 @@ def main():
             batch = batch.reshape(-1)
 
             # add episode reward info
-            train_episode_reward = batch["episode_reward"][batch["done"]]
-            if batch["episode_reward"][batch["done"]].numel() > 0:
-                log_info.update({"train_episode_rewards": train_episode_reward.mean()})
+            # train_episode_reward = batch["episode_reward"][batch["done"]]
+            # if batch["episode_reward"][batch["done"]].numel() > 0:
+            #     log_info.update({"train_episode_rewards": train_episode_reward.mean()})
             # episode_steps = batch["episode_steps"][batch["done"]]
 
             # PPO epochs
