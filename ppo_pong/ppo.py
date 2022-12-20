@@ -48,7 +48,7 @@ def main():
 
         # 1.3 Apply transformations to vec env - standard DeepMind Atari - Order of transforms is important!
         transformed_vec_env = TransformedEnv(vec_env)
-        # transformed_vec_env.append_transform(NoopResetEnv(noops=30))  # Start with 30 random action. TODO: seems incompatible with frame skip and ParallelEnv
+        # transformed_vec_env.append_transform(NoopResetEnv(noops=30))  # Start with 30 random action. incompatible with frame skip and ParallelEnv ?
         transformed_vec_env.append_transform(ToTensorImage())  # change shape from [h, w, 3] to [3, h, w]
         transformed_vec_env.append_transform(Resize(w=84, h=84))  # Resize image
         transformed_vec_env.append_transform(GrayScale())  # Convert to Grayscale
