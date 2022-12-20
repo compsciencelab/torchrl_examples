@@ -18,7 +18,6 @@ from torchrl.modules import SafeModule, ProbabilisticActor, ValueOperator, Actor
 
 # Collector imports
 from torchrl.collectors.collectors import SyncDataCollector
-from torchrl.collectors.collectors import MultiSyncDataCollector  # This one gives an error related to reset!
 
 # Loss imports
 from torchrl.objectives import ClipPPOLoss
