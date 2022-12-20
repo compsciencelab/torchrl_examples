@@ -11,6 +11,7 @@ from torchrl.envs.vec_env import ParallelEnv
 from torchrl.envs.transforms import ToTensorImage, GrayScale, CatFrames, NoopResetEnv, Resize
 
 # Model imports
+from torchrl.envs import EnvCreator
 from torchrl.envs.utils import set_exploration_mode
 from torchrl.modules.models import ConvNet, MLP
 from torchrl.modules.distributions import OneHotCategorical
@@ -33,7 +34,7 @@ def main():
 
     args = get_args()
 
-    device = torch.device("cpu") if torch.cuda.is_available() else torch.device("cuda:0")
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     # 1. Define environment --------------------------------------------------------------------------------------------
 
@@ -41,7 +42,7 @@ def main():
     def env_factory():
         """Creates an instance of the environment."""
 
-        create_env_fn = lambda: GymEnv(env_name=args.env_name, frame_skip=args.frame_skip)
+        create_env_fn = EnvCreator(lambda: GymEnv(env_name=args.env_name, frame_skip=args.frame_skip))
 
         # 1.2 Create env vector
         vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=args.num_parallel_envs)
@@ -154,9 +155,13 @@ def main():
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
 
-    # Ugly hack, otherwise I get errors
-    critic.out_keys = ['state_value', 'common_features']
-    actor.out_keys = ['action', 'common_features', 'logits']
+    # sanity check
+    actor(env_factory().reset())
+    actor_critic(env_factory().reset())
+
+    # # Ugly hack, otherwise I get errors
+    # critic.out_keys = ['state_value', 'common_features']
+    # actor.out_keys = ['action', 'common_features', 'logits']
 
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
@@ -215,13 +220,10 @@ def main():
 
             log_info = {}
 
-            # Compute advantage with the whole batch
-            batch = advantage_module(batch)
 
             # We don't use memory networks, so sequence dimension is not relevant
-            batch_size = batch.batch_size.numel()
+            batch_size = batch["mask"].sum().item()
             collected_frames += batch_size
-            batch = batch.reshape(-1)
 
             # add episode reward info
             # train_episode_reward = batch["episode_reward"][batch["done"]]
@@ -232,12 +234,17 @@ def main():
             # PPO epochs
             for epoch in range(args.num_ppo_epochs):
 
+                # Compute advantage with the whole batch
+                batch = advantage_module(batch)
+
+                batch_view = batch[batch["mask"].squeeze(-1)]
+
                 # Create a random permutation in every epoch
                 for mini_batch_idxs in BatchSampler(
                         SubsetRandomSampler(range(batch_size)), args.mini_batch_size, drop_last=True):
 
                     # select idxs to create mini_batch
-                    mini_batch = batch[mini_batch_idxs].clone()
+                    mini_batch = batch_view[mini_batch_idxs].clone()
 
                     # Forward pass
                     loss = loss_module(mini_batch)
