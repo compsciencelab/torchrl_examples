@@ -1,5 +1,5 @@
 # Logger
-experiment_name: cartpole_pong
+experiment_name: cartpole_ppo
 agent_name: ppo_agent
 wandb_key: null
 log_dir: /tmp/cartpole_ppo
