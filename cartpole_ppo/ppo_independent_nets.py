@@ -116,7 +116,7 @@ def main():
         td = critic(td)
         del td
 
-    # 2. Define Collector ----------------------------------------------------------------------------------------------
+    # 3. Define Collector ----------------------------------------------------------------------------------------------
 
     print(args.total_frames)
     collector = SyncDataCollector(
@@ -129,7 +129,7 @@ def main():
         frames_per_batch=args.steps_per_env * args.num_parallel_envs,
     )
 
-    # 3. Define Advantage module  --------------------------------------------------------------------------------------
+    # 4. Define Advantage module  --------------------------------------------------------------------------------------
 
     advantage_module = GAE(
         gamma=args.gamma,
@@ -138,7 +138,7 @@ def main():
         average_gae=True,
     )
 
-    # 4. Define logger -------------------------------------------------------------------------------------------------
+    # 5. Define logger -------------------------------------------------------------------------------------------------
 
     # Handle wandb init
     if args.wandb_key:
@@ -147,7 +147,7 @@ def main():
     else:
         mode = "disabled"
 
-    # 5. Define training loop ------------------------------------------------------------------------------------------
+    # 6. Define training loop ------------------------------------------------------------------------------------------
 
     network_updates = 0
     collected_frames = 0
