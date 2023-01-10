@@ -137,14 +137,6 @@ def main():
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
 
-    # 2.6 Initialize the model by running a forward pass
-    with torch.no_grad():
-        td = test_env.rollout(max_steps=100)
-        td = td.to(device)
-        td = actor(td)
-        td = critic(td)
-        del td
-
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
     print(args.total_frames)

@@ -108,14 +108,6 @@ def main():
         in_keys=in_keys,
     ).to(device)
 
-    # 2.6 Initialize the model by running a forward pass
-    with torch.no_grad():
-        td = test_env.rollout(max_steps=100)
-        td = td.to(device)
-        td = actor(td)
-        td = critic(td)
-        del td
-
     # 3. Define Collector ----------------------------------------------------------------------------------------------
 
     print(args.total_frames)
