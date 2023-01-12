@@ -1,21 +1,21 @@
+import math
 import time
 import yaml
 import wandb
 import torch
 import argparse
+import itertools
 
 # Environment imports
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs import TransformedEnv
 from torchrl.envs.vec_env import ParallelEnv
-from torchrl.envs.transforms import ToTensorImage, GrayScale, CatFrames, NoopResetEnv, Resize
-from .transforms.reward_sum import RewardSum
-from .transforms.step_limit import StepLimit
+from torchrl.envs.transforms import RewardSum
 
 # Model imports
-from torchrl.envs import EnvCreator
+from torchrl.objectives.utils import distance_loss
 from torchrl.envs.utils import set_exploration_mode
-from torchrl.modules.models import ConvNet, MLP
+from torchrl.modules.models import MLP
 from torchrl.modules.distributions import OneHotCategorical
 from torchrl.modules import SafeModule, ProbabilisticActor, ValueOperator, ActorValueOperator
 
@@ -23,8 +23,8 @@ from torchrl.modules import SafeModule, ProbabilisticActor, ValueOperator, Actor
 from torchrl.collectors.collectors import SyncDataCollector
 
 # Loss imports
-from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.advantages import GAE
+from torchrl.objectives import ClipPPOLoss
 
 # Training loop imports
 from torch.optim import Adam
@@ -36,81 +36,64 @@ def main():
 
     args = get_args()
 
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
 
     # 1. Define environment --------------------------------------------------------------------------------------------
 
     # 1.1 Define env factory
-    def env_factory():
+    def env_factory(num_workers):
         """Creates an instance of the environment."""
 
-        create_env_fn = EnvCreator(lambda: GymEnv(env_name=args.env_name, frame_skip=args.frame_skip))
+        create_env_fn = lambda: GymEnv(env_name="CartPole-v0")
 
         # 1.2 Create env vector
-        vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=args.num_parallel_envs)
+        vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=num_workers)
 
         # 1.3 Apply transformations to vec env - standard DeepMind Atari - Order of transforms is important!
         transformed_vec_env = TransformedEnv(vec_env)
-        # transformed_vec_env.append_transform(NoopResetEnv(noops=30))  # Start with 30 random action. incompatible with frame skip and ParallelEnv ?
-        transformed_vec_env.append_transform(ToTensorImage())  # change shape from [h, w, 3] to [3, h, w]
-        transformed_vec_env.append_transform(Resize(w=84, h=84))  # Resize image
-        transformed_vec_env.append_transform(GrayScale())  # Convert to Grayscale
-        transformed_vec_env.append_transform(CatFrames(N=4))  # Stack last 4 frames
         transformed_vec_env.append_transform(RewardSum())
-        transformed_vec_env.append_transform(StepLimit())
 
         return transformed_vec_env
 
     # Sanity check
-    test_env = env_factory()
+    test_env = env_factory(num_workers=1)
     test_input = test_env.reset()
-    assert "pixels" in test_input.keys()
+    num_inputs = test_env.specs["observation_spec"]["observation"].shape[-1]
     num_actions = test_env.specs["action_spec"].space.n
 
     # 2. Define model --------------------------------------------------------------------------------------------------
 
     # 2.1 Define input keys
-    in_keys = ["pixels"]
+    in_keys = ["observation"]
 
-    # 2.2 Define a shared Module and TensorDictModule (CNN + MLP)
-
-    # Define CNN
-    common_cnn = ConvNet(
-        activation_class=torch.nn.ReLU,
-        num_cells=[32, 64, 64],
-        kernel_sizes=[8, 4, 3],
-        strides=[4, 2, 1],
-    )
-    common_cnn_output = common_cnn(torch.ones_like(test_input["pixels"]))
-
-    # Add MLP on top of shared MLP
-    common_mlp = MLP(
-        in_features=common_cnn_output.shape[-1],
-        activation_class=torch.nn.ReLU,
+    # 2.2 Define shared module
+    shared_mlp = MLP(
+        in_features=num_inputs,
+        activation_class=torch.nn.Tanh,
         activate_last_layer=True,
-        out_features=448,
-        num_cells=[256])
-    common_mlp_output = common_mlp(common_cnn_output)
-
-    # Define shared net as TensorDictModule
-    common_module = SafeModule(  # Like TensorDictModule
-        module=torch.nn.Sequential(common_cnn, common_mlp),
+        out_features=128,
+        num_cells=[128],
+    )
+    shared_module = SafeModule(  # Like TensorDictModule
+        module=shared_mlp,
         in_keys=in_keys,
         out_keys=["common_features"],
     )
 
-    # 2.3 Define on head for the policy
+    # 2.2 Define actor
 
-    # Define Module
-    policy_net = MLP(
-        in_features=common_mlp_output.shape[-1],
+    # Define MLP net
+    policy_mlp = MLP(
+        in_features=128,
+        activation_class=torch.nn.Tanh,
+        activate_last_layer=False,
         out_features=num_actions,
-        num_cells=[]
+        num_cells=[64],
     )
 
-    # Define TensorDictModule
-    policy_module = SafeModule(  # TODO: The naming of SafeModule is confusing
-        module=policy_net,
+    # Define policy TensorDictModule
+    policy_module = SafeModule(  # Like TensorDictModule
+        module=policy_mlp,
         in_keys=["common_features"],
         out_keys=["logits"],
     )
@@ -118,66 +101,56 @@ def main():
     # Add probabilistic sampling of the actions
     policy_module = ProbabilisticActor(
         policy_module,
-        in_keys=["logits"],  # TODO: Seems like only "logits" can be used as in_keys
-        #        out_keys=["action"],
+        in_keys=["logits"],
+        out_keys=["action"],
         distribution_class=OneHotCategorical,
         distribution_kwargs={},
         return_log_prob=True,
     )
 
-    # 2.4 Define another head for the value
+    # 2.3 Define critic
 
-    # Define Module
-    value_net = MLP(
-        in_features=common_mlp_output.shape[-1],
+    # Define MLP net
+    value_mlp = MLP(
+        in_features=128,
+        activation_class=torch.nn.Tanh,
+        activate_last_layer=False,
         out_features=1,
-        num_cells=[]
+        num_cells=[64],
     )
 
     # Define TensorDictModule
-    value_module = ValueOperator(
-        value_net,
+    critic_module = ValueOperator(
+        value_mlp,
         in_keys=["common_features"],
     )
 
-    # 2.5 Wrap modules in a single ActorCritic operator
+    # Define actor critic
 
     actor_critic = ActorValueOperator(
-        common_operator=common_module,
+        common_operator=shared_module,
         policy_operator=policy_module,
-        value_operator=value_module,
+        value_operator=critic_module,
     ).to(device)
 
-    # 2.6 Initialize the model by running a forward pass
-    with torch.no_grad():
-        td = test_env.rollout(max_steps=1000)
-        td = td.to(device)
-        td = actor_critic(td)
-
-    # TODO: why wrap them together and then get separate operators ?
     # Get independent operators for actor and critic, to be able to call only one of them
     actor = actor_critic.get_policy_operator()
     critic = actor_critic.get_value_operator()
 
-    # sanity check
-    actor(env_factory().reset())
-    actor_critic(env_factory().reset())
-
-    # # Ugly hack, otherwise I get errors
-    # critic.out_keys = ['state_value', 'common_features']
-    # actor.out_keys = ['action', 'common_features', 'logits']
-
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
+    print(args.total_frames)
     collector = SyncDataCollector(
         create_env_fn=env_factory,
-        create_env_kwargs=None,
-        policy=actor_critic,
+        create_env_kwargs={"num_workers": args.num_parallel_envs},
+        policy=actor,
         total_frames=args.total_frames,
+        device=device,
+        passing_device=device,
         frames_per_batch=args.steps_per_env * args.num_parallel_envs,
     )
 
-    # 3. Define Loss ---------------------------------------------------------------------------------------------------
+    # 3. Define Advantage module and loss ------------------------------------------------------------------------------
 
     advantage_module = GAE(
         gamma=args.gamma,
@@ -211,10 +184,9 @@ def main():
     collected_frames = 0
     batch_size = args.steps_per_env * args.num_parallel_envs
     num_mini_batches = batch_size // args.mini_batch_size
+    optimizer = Adam(params=itertools.chain(actor.parameters(), critic.parameters()), lr=args.lr)
     total_network_updates = (args.total_frames // batch_size) * args.num_ppo_epochs * num_mini_batches
-    optimizer = Adam(params=actor_critic.parameters(), lr=args.lr)
     scheduler = LinearLR(optimizer, total_iters=total_network_updates, start_factor=1.0, end_factor=0.1)
-    evaluation_frequency = 100  # In number of network frames
 
     with wandb.init(project=args.experiment_name, name=args.agent_name, config=args, mode=mode):
 
@@ -222,44 +194,46 @@ def main():
 
         for batch in collector:
 
-            log_info = {}
+            batch = batch.to(device)
 
+            # Compute advantage with the whole batch
+            with torch.no_grad():
+                batch = advantage_module(batch)
 
             # We don't use memory networks, so sequence dimension is not relevant
-            batch_size = batch["mask"].sum().item()
+            batch = batch[batch["mask"].squeeze(-1)]
+            batch_size = batch.batch_size.numel()
             collected_frames += batch_size
 
             # add episode reward info
-            # train_episode_reward = batch["episode_reward"][batch["done"]]
-            #if batch["episode_reward"][batch["done"]].numel() > 0:
-            #     log_info.update({"train_episode_rewards": train_episode_reward.mean()})
-            # episode_steps = batch["episode_steps"][batch["done"]]
+            train_episode_reward = batch["episode_reward"][batch["done"]]
 
             # PPO epochs
             for epoch in range(args.num_ppo_epochs):
-
-                # Compute advantage with the whole batch
-                batch = advantage_module(batch)
-
-                batch_view = batch[batch["mask"].squeeze(-1)]
 
                 # Create a random permutation in every epoch
                 for mini_batch_idxs in BatchSampler(
                         SubsetRandomSampler(range(batch_size)), args.mini_batch_size, drop_last=True):
 
-                    # select idxs to create mini_batch
-                    mini_batch = batch_view[mini_batch_idxs].clone()
+                    log_info = {}
 
-                    # Forward pass
+                    if batch["episode_reward"][batch["done"]].numel() > 0:
+                        log_info.update({
+                            "train_episode_rewards": train_episode_reward.mean(),
+                        })
+
+                    # Get data
+                    mini_batch = batch[mini_batch_idxs].clone()
+
+                    # Compute loss
                     loss = loss_module(mini_batch)
-
-                    # Add up losses
                     loss_sum = sum([item for key, item in loss.items() if key.startswith("loss")])
 
                     # Update networks
                     optimizer.zero_grad()
                     loss_sum.backward()
-                    torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), max_norm=0.5)
+
+                    torch.nn.utils.clip_grad_norm_(itertools.chain(actor.parameters(), critic.parameters()), max_norm=0.5)
                     optimizer.step()
                     scheduler.step()
                     network_updates += 1
@@ -267,10 +241,8 @@ def main():
                     log_info.update({
                         "loss": loss_sum.item(),
                         "loss_critic": loss["loss_critic"].item(),
-                        "loss_entropy": loss["loss_entropy"].item(),
                         "loss_objective": loss["loss_objective"].item(),
-                        "learning_rate": float(scheduler.get_last_lr()[0]),
-                        "collected_frames": collected_frames,
+                        "lr": float(scheduler.get_last_lr()[0]),
                     })
 
                     if network_updates % args.evaluation_frequency == 0 and network_updates != 0:
@@ -279,22 +251,23 @@ def main():
                             test_env.eval()
                             test_td = test_env.rollout(
                                 policy=actor,
-                                max_steps=100000,
+                                max_steps=100_000,
                                 auto_reset=True,
                                 auto_cast_to_device=True,
                             ).clone()
-                        log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
+                        log_info.update({"test_episode_reward": test_td["reward"].sum()})
 
                     # Print an informative message in the terminal
                     fps = int(collected_frames * args.frame_skip / (time.time() - start_time))
                     print_msg = f"Update {network_updates}, num " \
-                                f"samples collected {collected_frames * args.frame_skip}, FPS {fps}\n    "
+                                f"samples collected {collected_frames * args.frame_skip}, FPS {fps} "
                     for k, v in log_info.items():
                         print_msg += f"{k}: {v} "
                     print(print_msg, flush=True)
 
                     log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
                     wandb.log(log_info, step=network_updates)
+
                     del mini_batch
 
             # Update collector weights!

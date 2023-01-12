@@ -1,0 +1,28 @@
+# Logger
+experiment_name: cartpole_ppo
+agent_name: ppo_agent
+wandb_key: null
+log_dir: /tmp/cartpole_ppo
+
+# Environment
+env_name: CartPole-v0
+frame_skip: 1
+
+# Collector
+total_frames: 250_000 # without accounting for frame skip
+num_parallel_envs: 4
+steps_per_env: 32 # between network updates
+
+# Loss
+gamma: 0.99
+clip_epsilon: 0.1
+loss_critic_type: l2
+entropy_coef: 0.0
+critic_coef: 1.0
+gae_lamdda: 0.95
+
+# Training loop
+lr: 0.0001
+num_ppo_epochs: 3
+mini_batch_size: 32  # so 4 mini batch
+evaluation_frequency: 100  # In number of network updates

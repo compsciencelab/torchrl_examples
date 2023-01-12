@@ -17,7 +17,7 @@ steps_per_env: 128 # between network updates
 gamma: 0.99
 clip_epsilon: 0.1
 loss_critic_type: l2
-entropy_coef: 0.01
+entropy_coef: 0.0001
 critic_coef: 1.0
 gae_lamdda: 0.95
 
