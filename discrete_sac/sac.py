@@ -262,7 +262,7 @@ def main():
                     entropies.append(loss_td["entropy"].item())
 
             rewards.append(
-                (i, (args.env_per_collector * args.frames_per_batch)/torch.unique(tensordict["traj_ids"]).shape[0])
+                (i, args.frames_per_batch/torch.unique(tensordict["traj_ids"]).shape[0])
             )
             wandb.log(
                 {   "unique traj": torch.unique(tensordict["traj_ids"]).shape[0],
