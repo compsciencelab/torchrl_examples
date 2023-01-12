@@ -3,16 +3,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
-from numbers import Number
-from typing import Union
 
-import numpy as np
+from numbers import Number
 import torch
 
-from tensordict.nn import TensorDictSequential
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torch import Tensor
 
 from torchrl.envs.utils import set_exploration_mode, step_mdp
 from torchrl.modules import SafeModule
