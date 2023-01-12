@@ -14,159 +14,25 @@ import wandb
 from sac_loss import SACLoss
 
 from torch import nn, optim
-from torchrl.collectors import MultiaSyncDataCollector
-from torchrl.data import TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer
+from torchrl.collectors import SyncDataCollector
+from torchrl.data import TensorDictPrioritizedReplayBuffer, TensorDictReplayBuffer, CompositeSpec
 
 from torchrl.data.replay_buffers.storages import LazyMemmapStorage
-from torchrl.envs import (
-    CatTensors,
-    DoubleToFloat,
-    EnvCreator,
-    ObservationNorm,
-    ParallelEnv,
-)
+from torchrl.envs import ParallelEnv, TransformedEnv, ObservationNorm, Compose, \
+    CatTensors, DoubleToFloat, EnvCreator, RewardSum
 
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.transforms import RewardScaling, TransformedEnv
 from torchrl.envs.utils import set_exploration_mode
 from torchrl.modules import MLP, ProbabilisticActor, SafeModule
 from torchrl.modules.distributions import OneHotCategorical
+from torch.distributions import Categorical
 
 from torchrl.modules.tensordict_module.actors import ProbabilisticActor, ValueOperator
 
 from torchrl.objectives import SoftUpdate
 from torchrl.trainers import Recorder
 
-
-def make_env():
-    """
-    Create a base env
-    """
-    env_args = (args.task,)
-    env_library = GymEnv
-
-    env_kwargs = {
-        "device": device,
-        "frame_skip": args.frame_skip,
-        "from_pixels": args.from_pixels,
-        "pixels_only": args.from_pixels,
-    }
-    env = env_library(*env_args, **env_kwargs)
-    return env
-
-
-def make_transformed_env(
-    env,
-    stats=None,
-):
-    """
-    Apply transforms to the env (such as reward scaling and state normalization)
-    """
-
-    env = TransformedEnv(env)
-
-    env.append_transform(RewardScaling(loc=0.0, scale=args.reward_scaling))
-
-    selected_keys = list(env.observation_spec.keys())
-    out_key = "observation_vector"
-    env.append_transform(CatTensors(in_keys=selected_keys, out_key=out_key))
-
-    #  we normalize the states
-    if stats is None:
-        _stats = {"loc": 0.0, "scale": 1.0}
-    else:
-        _stats = stats
-    env.append_transform(
-        ObservationNorm(**_stats, in_keys=[out_key], standard_normal=True)
-    )
-    env.append_transform(DoubleToFloat(in_keys=[out_key], in_keys_inv=[]))
-
-    return env
-
-
-def parallel_env_constructor(
-    stats,
-    num_worker=1,
-    **env_kwargs,
-):
-    if num_worker == 1:
-        env_creator = EnvCreator(
-            lambda: make_transformed_env(make_env(), stats, **env_kwargs)
-        )
-        return env_creator
-
-    parallel_env = ParallelEnv(
-        num_workers=num_worker,
-        create_env_fn=EnvCreator(lambda: make_env()),
-        create_env_kwargs=None,
-        pin_memory=False,
-    )
-    env = make_transformed_env(parallel_env, stats, **env_kwargs)
-    return env
-
-
-def get_stats_random_rollout(proof_environment, key: Optional[str] = None):
-    print("computing state stats")
-    n = 0
-    td_stats = []
-    while n < args.init_env_steps:
-        _td_stats = proof_environment.rollout(max_steps=args.init_env_steps)
-        n += _td_stats.numel()
-        _td_stats_select = _td_stats.to_tensordict().select(key).cpu()
-        if not len(list(_td_stats_select.keys())):
-            raise RuntimeError(
-                f"key {key} not found in tensordict with keys {list(_td_stats.keys())}"
-            )
-        td_stats.append(_td_stats_select)
-        del _td_stats, _td_stats_select
-    td_stats = torch.cat(td_stats, 0)
-
-    m = td_stats.get(key).mean(dim=0)
-    s = td_stats.get(key).std(dim=0)
-    m[s == 0] = 0.0
-    s[s == 0] = 1.0
-
-    print(
-        f"stats computed for {td_stats.numel()} steps. Got: \n"
-        f"loc = {m}, \n"
-        f"scale: {s}"
-    )
-    if not torch.isfinite(m).all():
-        raise RuntimeError("non-finite values found in mean")
-    if not torch.isfinite(s).all():
-        raise RuntimeError("non-finite values found in sd")
-    stats = {"loc": m, "scale": s}
-    return stats
-
-
-def get_env_stats():
-    """
-    Gets the stats of an environment
-    """
-    proof_env = make_transformed_env(make_env(), None)
-    proof_env.set_seed(args.seed)
-    stats = get_stats_random_rollout(
-        proof_env,
-        key="observation_vector",
-    )
-    # make sure proof_env is closed
-    proof_env.close()
-    return stats
-
-
-def make_recorder(actor_model_explore, stats):
-    # test_env = parallel_env_constructor(stats, num_worker=5)
-    base_env = make_env()
-    test_env = make_transformed_env(base_env, stats)
-    recorder_obj = Recorder(
-        record_frames=1000,
-        frame_skip=args.frame_skip,
-        policy_exploration=actor_model_explore,
-        recorder=test_env,
-        exploration_mode="mean",
-        record_interval=args.record_interval,
-    )
-    return recorder_obj
 
 
 def make_replay_buffer(make_replay_buffer=3):
@@ -202,47 +68,64 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # get stats for normalization
-    stats = get_env_stats()
 
-    # Create Environment
-    train_env = parallel_env_constructor(stats=stats, num_worker=args.env_per_collector)
+    # 1. Define environment --------------------------------------------------------------------------------------------
+
+    # 1.1 Define env factory
+    def env_factory(num_workers):
+        """Creates an instance of the environment."""
+
+        create_env_fn = lambda: GymEnv(env_name=args.task)
+
+        # 1.2 Create env vector
+        vec_env = ParallelEnv(create_env_fn=create_env_fn, num_workers=num_workers)
+
+        # 1.3 Apply transformations to vec env - standard DeepMind Atari - Order of transforms is important!
+        transformed_vec_env = TransformedEnv(vec_env)
+        transformed_vec_env.append_transform(RewardSum())
+
+        return transformed_vec_env
+
+    # Sanity check
+    test_env = env_factory(num_workers=3)
+    test_input = test_env.reset()
+    num_inputs = test_env.specs["observation_spec"]["observation"].shape[-1]
+    num_actions = test_env.specs["action_spec"].space.n
 
     # Create Agent
 
     # Define Actor Network
-    in_keys = ["observation_vector"]
-    action_spec = train_env.action_spec
-    
+    in_keys = ["observation"]
+      
     actor_net_kwargs = {
         "num_cells": [256, 256],
-        "out_features": action_spec.shape[0],
+        "out_features": num_actions,
         "activation_class": nn.ReLU,
     }
 
     actor_net = MLP(**actor_net_kwargs)
 
-    in_keys_actor = in_keys
     actor_module = SafeModule(
-        actor_net,
-        in_keys=in_keys_actor,
-        out_keys=["action_logits"],
+        #spec=CompositeSpec(action=test_env.specs["action_spec"]),
+        module=actor_net,
+        in_keys=in_keys,
+        out_keys=["logits"],
     )
     actor = ProbabilisticActor(
-        spec=action_spec,
-        dist_in_keys={"logits": "action_logits"},
+        spec=CompositeSpec(action=test_env.specs["action_spec"]),
         module=actor_module,
-        sample_out_key=["action"],
-        distribution_class=OneHotCategorical,
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=OneHotCategorical, # OneHot
         distribution_kwargs={},
         default_interaction_mode="random",
         return_log_prob=False,
-    )
+    ).to(device)
 
     # Define Critic Network
     qvalue_net_kwargs = {
         "num_cells": [256, 256],
-        "out_features": action_spec.shape[0],
+        "out_features": num_actions,
         "activation_class": nn.ReLU,
     }
 
@@ -253,28 +136,26 @@ def main():
     qvalue = ValueOperator(
         in_keys=in_keys,
         module=qvalue_net,
-    )
-
-    model = nn.ModuleList([actor, qvalue]).to(device)
-
-    # add forward pass for initialization with proof env
-    proof_env = make_transformed_env(make_env(), stats)
-
+    ).to(device)
+    
     # init nets
-    with torch.no_grad(), set_exploration_mode("random"):
-        td = proof_env.reset()
+    with torch.no_grad():
+        td = test_env.reset()
         td = td.to(device)
-        for net in model:
-            net(td)
+        actor(td)
+        qvalue(td)
+
     del td
-    proof_env.close()
+    test_env.close()
+    test_env.eval()
 
-    actor_model_explore = model[0]
-
+    model = torch.nn.ModuleList([actor, qvalue])
+    
     # Create SAC loss
     loss_module = SACLoss(
         actor_network=model[0],
         qvalue_network=model[1],
+        action_spec=CompositeSpec(action=test_env.specs["action_spec"]),
         num_qvalue_nets=2,
         gamma=args.gamma,
         target_entropy_weight=args.target_entropy_weight,
@@ -286,30 +167,20 @@ def main():
 
     # Make Off-Policy Collector
 
-    collector = MultiaSyncDataCollector(
-        create_env_fn=[train_env],
-        policy=actor_model_explore,
+    collector = SyncDataCollector(
+        env_factory,
+        create_env_kwargs={"num_workers": args.env_per_collector},
+        policy=model[0],
+        frames_per_batch=args.frames_per_batch,
+        max_frames_per_traj=args.max_frames_per_traj,
         total_frames=args.total_frames,
-        max_frames_per_traj=200, # args.frames_per_batch,
-        frames_per_batch=args.env_per_collector * args.frames_per_batch,
-        init_random_frames=args.init_random_frames,
-        reset_at_each_iter=True,
-        postproc=None,
-        split_trajs=True,
-        devices=[device],  # device for execution
-        passing_devices=[device],  # device where data will be stored and passed
-        seed=None,
-        pin_memory=False,
-        update_at_each_batch=False,
-        exploration_mode="random",
+        device=args.device,
+        passing_device=args.device,
     )
     collector.set_seed(args.seed)
 
     # Make Replay Buffer
     replay_buffer = make_replay_buffer()
-
-    # Trajectory recorder for evaluation
-    recorder = make_recorder(actor_model_explore, stats)
 
     # Optimizers
     params = list(loss_module.parameters()) + list([loss_module.log_alpha])
@@ -327,15 +198,11 @@ def main():
     r0 = None
     loss = None
 
-    with wandb.init(project="discrete_SAC_TorchRL", name=args.exp_name, config=args):
+    with wandb.init(project=args.project, name=args.exp_name, config=args):
         for i, tensordict in enumerate(collector):
 
             # update weights of the inference policy
             collector.update_policy_weights_()
-            
-            train_reward = torch.where(tensordict["done"]==True)[1].float().mean().item()
-            min_reward = torch.where(tensordict["done"]==True)[1].float().min().item()
-            max_reward = torch.where(tensordict["done"]==True)[1].float().max().item()
 
             if r0 is None:
                 r0 = tensordict["reward"].sum(-1).mean().item()
@@ -350,7 +217,7 @@ def main():
                 tensordict = tensordict.view(-1)
                 current_frames = tensordict.numel()
             collected_frames += current_frames
-            episodes += torch.where(tensordict["done"]==True)[0].shape[0]
+            episodes += torch.unique(tensordict["traj_ids"]).shape[0]
             replay_buffer.extend(tensordict.cpu())
 
             # optimization steps
@@ -364,7 +231,7 @@ def main():
                     entropies,
                 ) = ([], [], [], [], [], [])
                 for _ in range(
-                    args.env_per_collector * args.frames_per_batch * args.utd_ratio
+                    args.frames_per_batch * args.utd_ratio
                 ):
                     # sample from replay buffer
                     sampled_tensordict = replay_buffer.sample(args.batch_size).clone()
@@ -395,13 +262,11 @@ def main():
                     entropies.append(loss_td["entropy"].item())
 
             rewards.append(
-                (i, train_reward)
+                (i, (args.env_per_collector * args.frames_per_batch)/torch.unique(tensordict["traj_ids"]).shape[0])
             )
             wandb.log(
-                {
+                {   "unique traj": torch.unique(tensordict["traj_ids"]).shape[0],
                     "train_reward": rewards[-1][1],
-                    "max_rollout_reward": max_reward,
-                    "min_rollout_reward": min_reward,
                     "collected_frames": collected_frames,
                     "episodes": episodes,
                 }
@@ -417,19 +282,17 @@ def main():
                         "entropy": np.mean(entropies),
                     }
                 )
-            td_record = recorder(None)
-            if td_record is not None:
-                rewards_eval.append(
-                    (
-                        i,
-                        td_record["total_r_evaluation"]
-                        / 1,  # divide by number of eval worker
-                    )
-                )
+            with set_exploration_mode("random"), torch.no_grad(): # TODO: WHY MEAN GIVES YOU NANS
+                
+                eval_rollout = test_env.rollout(max_steps=args.max_frames_per_traj, policy=actor,
+                auto_cast_to_device=True,).clone()
+                eval_reward = eval_rollout["reward"].sum(-2).mean().item()
+                rewards_eval.append((i, eval_reward))
+                eval_str = f"eval cumulative reward: {rewards_eval[-1][1]: 4.4f} (init: {rewards_eval[0][1]: 4.4f})"
                 wandb.log({"test_reward": rewards_eval[-1][1]})
             if len(rewards_eval):
                 pbar.set_description(
-                    f"reward: {rewards[-1][1]: 4.4f} (r0 = {r0: 4.4f}), test reward: {rewards_eval[-1][1]: 4.4f}"
+                    f"reward: {rewards[-1][1]: 4.4f} (r0 = {r0: 4.4f})," + eval_str 
                 )
 
         collector.shutdown()
@@ -442,6 +305,7 @@ def get_args():
 
     # Configuration file, keep first
     parser.add_argument("--conf", "-c", default="conf.yaml")
+    parser.add_argument("--project", type=str, default="discrete_SAC_TorchRL")
     parser.add_argument(
         "--exp_name",
         type=str,
@@ -459,12 +323,6 @@ def get_args():
         type=int,
         default=1,
         help="Number of frames to skip also called action repeat. Default: 1",
-    )
-    parser.add_argument(
-        "--from_pixels",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use pixel observations. Default: False",
     )
     parser.add_argument(
         "--reward_scaling",
@@ -526,7 +384,7 @@ def get_args():
     parser.add_argument(
         "--max_frames_per_traj",
         type=int,
-        default=-1,
+        default=500,
         help="Maximum number of frames per rollout trajectory.",
     )
     parser.add_argument(
@@ -592,4 +450,5 @@ if __name__ == "__main__":
         and args.device == "cuda:0"
         else torch.device("cpu")
     )
+    print("Using device: ", device)
     main()

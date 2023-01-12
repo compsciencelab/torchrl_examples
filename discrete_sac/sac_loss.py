@@ -15,7 +15,8 @@ from tensordict.tensordict import TensorDict, TensorDictBase
 from torch import Tensor
 
 from torchrl.envs.utils import set_exploration_mode, step_mdp
-from torchrl.modules import SafeModule
+from torchrl.data import CompositeSpec
+from torchrl.modules.tensordict_module import SafeModule
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import (
     distance_loss,
@@ -63,6 +64,7 @@ class SACLoss(LossModule):
         self,
         actor_network: SafeModule,
         qvalue_network: SafeModule,
+        action_spec: CompositeSpec,
         num_qvalue_nets: int = 2,
         gamma: Number = 0.99,
         priotity_key: str = "td_error",
@@ -89,8 +91,6 @@ class SACLoss(LossModule):
             funs_to_decorate=["forward", "get_dist_params"],
         )
 
-        # let's make sure that actor_network has `return_log_prob` set to True
-        self.actor_network.return_log_prob = True
 
         self.delay_qvalue = delay_qvalue
         self.convert_to_functional(
@@ -129,13 +129,10 @@ class SACLoss(LossModule):
             )
 
         if target_entropy == "auto":
-            if actor_network.spec["action"] is None:
-                raise RuntimeError(
-                    "Cannot infer the dimensionality of the action. Consider providing "
-                    "the target entropy explicitely or provide the spec of the "
-                    "action tensor in the actor network."
-                )
-            target_entropy = - float(np.log(1.0 / actor_network.spec["action"].shape[0]) * target_entropy_weight)
+            target_entropy = -float(
+                np.log(1.0 / action_spec["action"].shape[0])
+                * target_entropy_weight
+            )
         self.register_buffer(
             "target_entropy", torch.tensor(target_entropy, device=device)
         )
@@ -241,20 +238,28 @@ class SACLoss(LossModule):
         )
 
         loss_actor = -(
-            (state_action_value_actor.min(0)[0] * probs[0]).sum(1, keepdim=True) - self.alpha * logp_pi_pol[0]
+            (state_action_value_actor.min(0)[0] * probs[0]).sum(1, keepdim=True)
+            - self.alpha * logp_pi_pol[0]
         ).mean()
 
-        next_state_value = (probs[1] *(next_state_action_value_qvalue.min(0)[0] - self.alpha * logp_pi[1])).sum(dim=1, keepdim=True)
+        next_state_value = (
+            probs[1]
+            * (next_state_action_value_qvalue.min(0)[0] - self.alpha * logp_pi[1])
+        ).sum(dim=1, keepdim=True)
 
         target_value = get_next_state_value(
             tensordict,
             gamma=self.gamma,
             pred_next_val=next_state_value,
         )
-        
+
         actions = torch.where(tensordict_select["action"])[1]
-        pred_val_1 = state_action_value_qvalue[0].gather(1, actions[:, None]).unsqueeze(0)
-        pred_val_2 = state_action_value_qvalue[1].gather(1, actions[:, None]).unsqueeze(0)
+        pred_val_1 = (
+            state_action_value_qvalue[0].gather(1, actions[:, None]).unsqueeze(0)
+        )
+        pred_val_2 = (
+            state_action_value_qvalue[1].gather(1, actions[:, None]).unsqueeze(0)
+        )
         pred_val = torch.cat([pred_val_1, pred_val_2], dim=0).squeeze()
         td_error = (pred_val - target_value.expand_as(pred_val)).pow(2)
         loss_qval = (
