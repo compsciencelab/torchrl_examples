@@ -243,7 +243,7 @@ def main():
     )
     actor = ProbabilisticActor(
         spec=action_spec,
-        dist_in_keys=["loc", "scale"],
+        in_keys=["loc", "scale"],
         module=actor_module,
         distribution_class=dist_class,
         distribution_kwargs=dist_kwargs,
@@ -467,7 +467,7 @@ def get_args():
     )
     parser.add_argument(
         "--from_pixels",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",#argparse.BooleanOptionalAction,
         default=False,
         help="Use pixel observations. Default: False",
     )
@@ -500,7 +500,7 @@ def get_args():
     )
     parser.add_argument(
         "--prb",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",#argparse.BooleanOptionalAction,
         default=False,
         help="Use Prioritized Experience Replay Buffer. Default: False",
     )
