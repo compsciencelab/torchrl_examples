@@ -147,7 +147,6 @@ def main():
     policy_module = ProbabilisticActor(
         policy_module,
         in_keys=["logits"],  # TODO: Seems like only "logits" can be used as in_keys
-        #        out_keys=["action"],
         distribution_class=dist.Categorical,
         distribution_kwargs={},
         return_log_prob=True,
@@ -192,10 +191,6 @@ def main():
     # sanity check
     actor(test_env.reset())
     actor_critic(test_env.reset())
-
-    # # Ugly hack, otherwise I get errors
-    # critic.out_keys = ['state_value', 'common_features']
-    # actor.out_keys = ['action', 'common_features', 'logits']
 
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
@@ -309,7 +304,7 @@ def main():
                     # Update networks
                     optimizer.zero_grad()
                     loss_sum.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), max_norm=10.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), max_norm=args.clip_grad)
                     optimizer.step()
                     scheduler.step()
                     network_updates += 1
