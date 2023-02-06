@@ -329,7 +329,7 @@ def get_args():
     )
     parser.add_argument(
         "--from_pixels",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",#argparse.BooleanOptionalAction,
         default=False,
         help="Use pixel observations. Default: False",
     )
@@ -362,7 +362,7 @@ def get_args():
     )
     parser.add_argument(
         "--prb",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",#argparse.BooleanOptionalAction,
         default=False,
         help="Use Prioritized Experience Replay Buffer. Default: False",
     )
