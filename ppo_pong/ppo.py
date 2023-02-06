@@ -23,7 +23,8 @@ from torchrl.modules.models import ConvNet, MLP
 from torchrl.modules import SafeModule, ProbabilisticActor, ValueOperator, ActorValueOperator
 
 # Collector imports
-from torchrl.collectors.collectors import SyncDataCollector
+from torchrl.collectors.collectors import SyncDataCollector, \
+    MultiSyncDataCollector
 
 # Loss imports
 from torchrl.objectives import ClipPPOLoss
@@ -103,7 +104,7 @@ def main():
 
     # Define CNN
     common_cnn = ConvNet(
-        activation_class=torch.nn.ELU,
+        activation_class=torch.nn.ReLU,
         num_cells=[32, 64, 64],
         kernel_sizes=[8, 4, 3],
         strides=[4, 2, 1],
@@ -113,10 +114,10 @@ def main():
     # Add MLP on top of shared MLP
     common_mlp = MLP(
         in_features=common_cnn_output.shape[-1],
-        activation_class=torch.nn.ELU,
+        activation_class=torch.nn.ReLU,
         activate_last_layer=True,
         out_features=448,
-        num_cells=[256]).to(device)
+        num_cells=[]).to(device)
     common_mlp_output = common_mlp(common_cnn_output)
 
     # Define shared net as TensorDictModule
@@ -132,7 +133,7 @@ def main():
     policy_net = MLP(
         in_features=common_mlp_output.shape[-1],
         out_features=num_actions,
-        num_cells=[]
+        num_cells=[256]
     ).to(device)
     policy_net[0].bias.data.fill_(0.0)
 
@@ -158,7 +159,7 @@ def main():
     value_net = MLP(
         in_features=common_mlp_output.shape[-1],
         out_features=1,
-        num_cells=[]
+        num_cells=[256]
     ).to(device)
 
     # Define TensorDictModule
@@ -195,10 +196,10 @@ def main():
     # 2. Define Collector ----------------------------------------------------------------------------------------------
 
     train_env = train_env.to(device_collection)
-    if device_collection != device:
-        actor_collection = deepcopy(actor).to(device_collection).requires_grad_(False)
-    else:
-        actor_collection = actor
+    # if device_collection != device:
+    #     actor_collection = deepcopy(actor).to(device_collection).requires_grad_(False)
+    # else:
+    #     actor_collection = actor
 
     # 3. Define Loss ---------------------------------------------------------------------------------------------------
 
@@ -217,6 +218,7 @@ def main():
         entropy_coef=args.entropy_coef,
         critic_coef=args.critic_coef,
         gamma=args.gamma,
+        normalize_advantage=False,
     )
 
     # 4. Define logger -------------------------------------------------------------------------------------------------
@@ -264,14 +266,25 @@ def main():
             collected_frames += batch.numel()
             yield batch
 
+    fpb = args.steps_per_env
+    total_frames = args.total_frames // args.frame_skip
+    # collector = dataloader(total_frames, fpb)
+    collector = MultiSyncDataCollector(
+        [train_env],
+        actor,
+        frames_per_batch=fpb * args.num_parallel_envs,
+        total_frames=total_frames,
+        devices=device_collection,
+        passing_devices=device_collection,
+        split_trajs=False,
+    )
+
     with wandb.init(project=args.experiment_name, name=args.agent_name, entity=args.entity, config=args, mode=mode):
-        total_frames = args.total_frames // args.frame_skip
-        fpb = args.steps_per_env
         pbar = tqdm.tqdm(total=total_frames)
         start_time = time.time()
 
 
-        for batch in dataloader(total_frames, fpb):
+        for batch in collector:
             batch = batch.cpu()
             log_info = {}
 
@@ -315,7 +328,7 @@ def main():
                         "loss_ent": loss["loss_entropy"].item(),
                         "loss_obj": loss["loss_objective"].item(),
                         "lr": float(scheduler.get_last_lr()[0]),
-                        "gn": grad_norm,
+                        "grad_norm": grad_norm,
                         "frames": collected_frames,
                         "reward": batch["reward"].mean().item(),
                         "traj_len": batch["step_count"].max().item(),
@@ -325,14 +338,14 @@ def main():
 
                     if network_updates % args.evaluation_frequency == 0 and network_updates != 0:
                         # Run evaluation in test environment
-                        with set_exploration_mode("random"):
+                        with set_exploration_mode("random"), torch.no_grad():
                             test_env.eval()
                             test_td = test_env.rollout(
                                 policy=actor,
                                 max_steps=10000,
                                 auto_reset=True,
                                 auto_cast_to_device=True,
-                                break_when_any_done=False,
+                                break_when_any_done=True,
                             ).clone()
                         log_info.update({"test_reward": test_td["reward"].squeeze(-1).sum(-1).mean()})
                         del test_td
@@ -346,7 +359,7 @@ def main():
                 pbar.set_description(print_msg)
                 log_info.update({"collected_frames": int(collected_frames * args.frame_skip), "fps": fps})
                 wandb.log(log_info, step=network_updates)
-
+            collector.update_policy_weights_()
 
 def get_args():
     """Reads conf.yaml file in the same directory"""
