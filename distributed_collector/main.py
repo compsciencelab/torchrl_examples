@@ -16,7 +16,7 @@ if __name__ == "__main__":
         "object_store_memory": 2 * 1024 ** 3
     }
 
-    print("Test 1: Collect data test in synchronous mode.")
+    print("\nTest 1: Collect data test in synchronous mode.\n")
 
     distributed_collector = DistributedCollector(
         collector_class=FakeCollector,
@@ -36,7 +36,7 @@ if __name__ == "__main__":
         print(f"batch {counter}, shape {batch.shape}")
     distributed_collector.stop()
 
-    print("Test 2: Collect data test in asynchronous mode.")
+    print("\nTest 2: Collect data test in asynchronous mode.\n")
 
     distributed_collector = DistributedCollector(
         collector_class=FakeCollector,
@@ -55,3 +55,5 @@ if __name__ == "__main__":
         counter += 1
         print(f"batch {counter}, shape {batch.shape}")
     distributed_collector.stop()
+
+    print("\nSuccess!")
