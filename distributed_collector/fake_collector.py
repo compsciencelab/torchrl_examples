@@ -54,7 +54,7 @@ class FakeCollector(IterableDataset, ABC):
         return TensorDict({"observation": torch.randn(self.shape)}, batch_size=self.shape)
 
     def set_weights(self, policy_weights={}):
-        """Update the worker actor version with provided weights."""
+        """Update the policy version with provided weights."""
         pass
 
 
